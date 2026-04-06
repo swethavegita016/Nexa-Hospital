@@ -1,10 +1,13 @@
 """
-agent.py — NEXA Hospital Appointment Assistant with Reminder Agent
-MCP disabled for Cloud Run compatibility (stdio not supported in containers)
+agent.py — NEXA Hospital Appointment Assistant
+Fixes:
+  1. Greeting uses IST (UTC+5:30) not server UTC
+  2. When only 1 doctor in specialty → auto-select, skip "which doctor" prompt
+  3. MCP disabled for Cloud Run
 """
 
 import os, sys, random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from google.adk import Agent
 from google.adk.tools.tool_context import ToolContext
@@ -136,9 +139,28 @@ REMINDERS: list = []
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+# FIX 1: Use IST (UTC+5:30) for greeting, not server UTC
+IST = timezone(timedelta(hours=5, minutes=30))
+
 def _greeting():
-    h = datetime.now().hour
-    return "Good morning" if h < 12 else "Good afternoon" if h < 17 else "Good evening"
+    """Return time-appropriate greeting in IST."""
+    h = datetime.now(IST).hour
+    if h < 12:
+        return "Good morning"
+    elif h < 17:
+        return "Good afternoon"
+    else:
+        return "Good evening"
+
+def _ist_now():
+    """Current IST datetime formatted string."""
+    return datetime.now(IST).strftime("%I:%M %p, %A %B %d %Y (IST)")
+
+def _ist_date():
+    """Current IST date formatted string."""
+    return datetime.now(IST).strftime("%A, %B %d %Y")
+
 
 def _new_patient_id():
     pid = "PAT-" + str(random.randint(1000, 9999))
@@ -155,18 +177,19 @@ def _resolve_doctor(name: str):
 def _parse_day(date_str: str) -> str:
     s = date_str.strip().lower()
     if "tomorrow" in s:
-        return (datetime.now() + timedelta(days=1)).strftime("%A")
+        return (datetime.now(IST) + timedelta(days=1)).strftime("%A")
     if "today" in s:
-        return datetime.now().strftime("%A")
+        return datetime.now(IST).strftime("%A")
     for fmt in ("%B %d, %Y", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
         try:
             return datetime.strptime(date_str.strip(), fmt).strftime("%A")
         except ValueError:
             continue
-    return datetime.now().strftime("%A")
+    return datetime.now(IST).strftime("%A")
 
 
 # ── Appointment Tools ──────────────────────────────────────────────────────
+
 def get_doctors_by_specialty(tool_context: ToolContext, specialty: str = None) -> dict:
     """Get list of doctors filtered by specialty."""
     out = []
@@ -177,6 +200,8 @@ def get_doctors_by_specialty(tool_context: ToolContext, specialty: str = None) -
                 "name": name,
                 "specialty": info["specialty"],
                 "qualification": info["qualification"],
+                "fee": info["fee"],
+                "rating": info["rating"],
             })
     if not out:
         return {
@@ -184,7 +209,13 @@ def get_doctors_by_specialty(tool_context: ToolContext, specialty: str = None) -
                      "Available: Dermatology, Cardiology, Orthopedics, Pediatrics, "
                      "General Medicine, Gynecology, Neurology"
         }
-    return {"doctors": out, "count": len(out)}
+    # FIX 2: Flag single-doctor results so agent auto-selects
+    return {
+        "doctors": out,
+        "count": len(out),
+        "auto_select": len(out) == 1,          # <-- key fix
+        "auto_selected_doctor": out[0]["name"] if len(out) == 1 else None,
+    }
 
 
 def get_doctor_slots(tool_context: ToolContext, doctor_name: str, date: str) -> dict:
@@ -230,7 +261,7 @@ def book_appointment(tool_context: ToolContext, patient_name: str, doctor_name: 
         "department": info["department"],
         "appointment_time": appointment_time, "appointment_date": appointment_date,
         "purpose": purpose, "fee": info["fee"], "status": "confirmed",
-        "booked_at": datetime.now().isoformat(),
+        "booked_at": datetime.now(IST).isoformat(),
     }
     db_save_meeting(
         title=f"{patient_name} – {matched}", purpose=purpose,
@@ -313,6 +344,7 @@ def list_appointments(tool_context: ToolContext) -> dict:
 
 
 # ── Reminder Tools ─────────────────────────────────────────────────────────
+
 def set_reminder(tool_context: ToolContext, patient_id: str, patient_name: str,
                  doctor_name: str, appointment_date: str, appointment_time: str,
                  reminder_minutes: int = 30) -> dict:
@@ -331,7 +363,7 @@ def set_reminder(tool_context: ToolContext, patient_id: str, patient_name: str,
             f"{reminder_minutes} minutes on {appointment_date} at {appointment_time}."
         ),
         "status": "scheduled",
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(IST).isoformat(),
     }
     REMINDERS.append(reminder)
     db_add_task(
@@ -373,9 +405,7 @@ def cancel_reminder(tool_context: ToolContext, reminder_id: str) -> dict:
 
 
 # ── MCP disabled for Cloud Run ─────────────────────────────────────────────
-# stdio-based MCP subprocesses cannot run in containerised Cloud Run instances.
-# All core features (booking, rescheduling, cancellation, reminders) work without MCP.
-print("ℹ️  MCP disabled — running in Cloud Run mode (stdio subprocesses not supported)")
+print("ℹ️  MCP disabled — Cloud Run mode (stdio subprocesses not supported)")
 _appt_tools = [
     get_doctors_by_specialty,
     get_doctor_slots,
@@ -386,18 +416,18 @@ _appt_tools = [
     list_appointments,
 ]
 
+_now  = _ist_now()
+_date = _ist_date()
 
-_now  = datetime.now().strftime("%I:%M %p, %A %B %d %Y")
-_date = datetime.now().strftime("%A, %B %d %Y")
 
+# ── Agents ─────────────────────────────────────────────────────────────────
 
-# ── Sub-agents ─────────────────────────────────────────────────────────────
 appointment_agent = Agent(
     name="appointment_agent",
     model=model_name,
     description="Handles all appointment booking, rescheduling and cancellation",
     instruction=f"""You are the Appointment module of NEXA Hospital Assistant.
-Current time: {_now}
+Current time (IST): {_now}
 
 TOOLS:
 - get_doctors_by_specialty → list doctors for a specialty
@@ -408,24 +438,25 @@ TOOLS:
 - cancel_appointment       → cancel
 - list_appointments        → all appointments
 
-WHEN listing doctors, show ONLY their names in a simple numbered list:
-"We have X doctors available for [specialty]:
-1. Dr. Name
-2. Dr. Name
-Which doctor would you like?"
-
-DO NOT show fee, rating, experience or qualifications unless patient explicitly asks.
-
 BOOKING FLOW:
-1. Specialty/concern mentioned → call get_doctors_by_specialty → show names only
-2. Doctor selected → call get_doctor_slots for their date
-3. Slot selected → confirm details → call book_appointment
-4. Show PAT-XXXX prominently: "🪪 Patient ID: PAT-XXXX — please save this!"
-5. After confirming booking, ALWAYS say:
-   "🔔 I'll also set a reminder 30 minutes before your appointment so you don't miss it!"
-   Then transfer to reminder_agent to set the reminder automatically.
+1. Patient mentions specialty/concern → call get_doctors_by_specialty
 
-RESCHEDULE/CANCEL: Ask for Patient ID → verify with get_appointment → confirm → execute.
+2. CHECK THE RESULT:
+   - If "auto_select" is TRUE (only 1 doctor found):
+     → DO NOT ask "which doctor would you like?"
+     → Immediately say: "Great! I found Dr. [name] for [specialty]. Let me check available slots."
+     → Call get_doctor_slots right away for that doctor and the patient's date
+   - If "auto_select" is FALSE (multiple doctors):
+     → Show numbered list of names only and ask which they prefer
+
+3. Once doctor and date confirmed → call get_doctor_slots → show available slots
+4. Patient selects slot → confirm details → call book_appointment
+5. Show PAT-XXXX prominently: "🪪 Patient ID: PAT-XXXX — please save this!"
+6. After booking say: "🔔 I'll set a reminder 30 minutes before your appointment!"
+   Then transfer to reminder_agent.
+
+RESCHEDULE/CANCEL: Ask for Patient ID → verify → confirm → execute.
+DO NOT show fee/rating/experience unless patient explicitly asks.
 Be calm, professional, and compassionate.""",
     tools=_appt_tools,
 )
@@ -437,30 +468,22 @@ reminder_agent = Agent(
     instruction="""You are the Reminder module of NEXA Hospital Assistant.
 
 TOOLS:
-- set_reminder:    Set a reminder for an appointment. Default is 30 minutes before.
-- get_reminders:   View all reminders for a patient.
-- cancel_reminder: Cancel a reminder by reminder ID.
+- set_reminder:    Set a reminder. Default 30 minutes before appointment.
+- get_reminders:   View reminders for a patient.
+- cancel_reminder: Cancel a reminder by ID.
 
-AFTER booking is confirmed, automatically call set_reminder using the patient
-details passed from appointment_agent (patient_id, patient_name, doctor_name,
-appointment_date, appointment_time). Use reminder_minutes=30 by default.
-
-Always confirm with:
-"🔔 Done! I've set a reminder for 30 minutes before your appointment. You're all set!"
-
-If the patient wants a different lead time (e.g. 1 hour before), adjust reminder_minutes
-accordingly and confirm the updated time.
-
+After booking confirmed, automatically call set_reminder with patient details.
+Always confirm: "🔔 Done! Reminder set for 30 minutes before your appointment. You're all set!"
+Adjust reminder_minutes if patient requests different lead time.
 Be warm and reassuring.""",
     tools=[set_reminder, get_reminders, cancel_reminder],
 )
 
-# ── Root agent ─────────────────────────────────────────────────────────────
 root_agent = Agent(
     name="productivity_root",
     model=model_name,
     description="NEXA — Hospital Appointment Assistant",
-    instruction=f"""You are NEXA — Hospital Appointment Assistant. Today is {_date}.
+    instruction=f"""You are NEXA — Hospital Appointment Assistant. Today is {_date} (IST).
 
 ON FIRST MESSAGE always greet exactly like this:
 ---
@@ -475,12 +498,12 @@ How can I assist you today?
 ---
 
 ROUTING:
-- book / appointment / doctor / specialty / available → appointment_agent
-- reschedule / change / move appointment             → appointment_agent
-- cancel appointment                                 → appointment_agent
-- my appointment / patient id / lookup               → appointment_agent
-- reminder / remind me / set reminder                → reminder_agent
-- view reminders / my reminders                      → reminder_agent
+- book / appointment / doctor / specialty / available / pain / concern → appointment_agent
+- reschedule / change / move appointment                              → appointment_agent
+- cancel appointment                                                  → appointment_agent
+- my appointment / patient id / lookup                                → appointment_agent
+- reminder / remind me / set reminder                                 → reminder_agent
+- view reminders / my reminders                                       → reminder_agent
 - emergency → "Please call 108 or go to the Emergency Department immediately. 🚨"
 
 After every successful booking, reminder_agent automatically sets a 30-min reminder.
